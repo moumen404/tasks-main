@@ -12,6 +12,7 @@ import time
 from threading import Event
 import logging
 from pymongo import MongoClient
+from functools import lru_cache
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,16 +26,24 @@ app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(16))
 ADMIN_SIGNUP_KEY = os.getenv('ADMIN_SIGNUP_KEY')
 
-# MongoDB setup with provided credentials
+# MongoDB setup with persistent connection
 MONGO_URI = "mongodb+srv://moumenettaibi746:hKT0oGJLNKofDQPf@cluster0tasksmain.02da2.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0tasksmain"
-mongo_client = MongoClient(MONGO_URI)
-db = mongo_client['task_manager']
-users_collection = db['users']
+mongo_client = None
+db = None
+users_collection = None
+
+def init_mongo():
+    global mongo_client, db, users_collection
+    if mongo_client is None:
+        mongo_client = MongoClient(MONGO_URI, maxPoolSize=50, minPoolSize=5)
+        db = mongo_client['task_manager']
+        users_collection = db['users']
+        logging.info("MongoDB connection initialized")
+
+# Initialize MongoDB connection at startup
+init_mongo()
 
 def format_gemini_response(text):
-    """
-    Removes common Markdown-like formatting from a text string.
-    """
     text = re.sub(r'\*\*|__|\*', '', text)
     text = re.sub(r'_', '', text)
     text = re.sub(r'#+\s*', '', text)
@@ -48,10 +57,10 @@ def format_gemini_response(text):
     text = re.sub(r'\s+', ' ', text)
     return text
 
+@lru_cache(maxsize=1)
 def load_data():
     users = list(users_collection.find())
     if not users:
-        # Initialize data with admin user if database is empty
         admin_password_hash = generate_password_hash('password')
         initial_user = {
             "id": str(uuid.uuid4()),
@@ -65,7 +74,6 @@ def load_data():
         users_collection.insert_one(initial_user)
         users = [initial_user]
     else:
-        # Ensure at least one admin exists
         if not any(user.get('is_admin', False) for user in users):
             users[0]['is_admin'] = True
             users_collection.update_one({"id": users[0]['id']}, {"$set": {"is_admin": True}})
@@ -73,13 +81,13 @@ def load_data():
 
 def save_data(data):
     try:
-        # Clear existing data and insert new data
         users_collection.drop()
         if data.get('users'):
             users_collection.insert_many(data['users'])
     except Exception as e:
         logging.error(f"Error saving data to MongoDB: {e}", exc_info=True)
 
+@lru_cache(maxsize=128)
 def get_user_data(user_id):
     user = users_collection.find_one({"id": user_id})
     if user:
@@ -91,6 +99,7 @@ def update_user_data(user_id, update_func):
     if user:
         update_func(user)
         users_collection.update_one({"id": user_id}, {"$set": user})
+        get_user_data.cache_clear()  # Clear cache for this user since data changed
         return True
     return False
 
@@ -251,6 +260,7 @@ def signup():
         'is_admin': is_admin
     }
     users_collection.insert_one(new_user)
+    load_data.cache_clear()  # Clear cache since a new user was added
     logging.info(f"New user '{email}' signed up successfully. Admin: {is_admin}")
     return jsonify({'success': True})
 
@@ -411,11 +421,7 @@ def generate_task_details_bg(user_id, goal_id):
     with app.app_context():
         try:
             user_data = get_user_data(user_id)
-            user_name = None
-            for user in load_data().get('users', []):
-                if user['id'] == user_id:
-                    user_name = user.get('name', 'User')
-                    break
+            user_name = user_data.get('name', 'User')
 
             def update_tasks(user_data):
                 for goal in user_data.get('goals', []):
@@ -431,33 +437,24 @@ IMPORTANCE: (just a number 1-100)"""
                                 if detail_response and detail_response.text:
                                     context_match = re.search(r"CONTEXT:\s*(.+?)(?=\n*IMPORTANCE:|$)", detail_response.text, re.DOTALL)
                                     importance_match = re.search(r"IMPORTANCE:\s*(\d+)", detail_response.text)
-                                    if context_match:
-                                        task['context'] = format_gemini_response(context_match.group(1).strip())
-                                    else:
-                                        task['context'] = "Task context not available"
-                                    if importance_match:
-                                        task['importance'] = importance_match.group(1)
-                                    else:
-                                        task['importance'] = "50"
+                                    task['context'] = format_gemini_response(context_match.group(1).strip()) if context_match else "Task context not available"
+                                    task['importance'] = importance_match.group(1) if importance_match else "50"
                                 else:
                                     task['context'] = "Task context not available"
                                     task['importance'] = "50"
                                 task['isGenerating'] = False
                                 logging.info(f"Generated details for task: {task['text']}")
                                 time.sleep(0.5)
-
                             except Exception as task_error:
                                 logging.error(f"Error generating details for task '{task['text']}': {task_error}", exc_info=True)
                                 task['isGenerating'] = False
                                 task['error'] = True
                                 task['context'] = "Failed to generate context"
                                 task['importance'] = "50"
-                                continue
                         break
             update_user_data(user_id, update_tasks)
             if goal_id in task_detail_events:
                 task_detail_events[goal_id].set()
-
         except Exception as e:
             logging.error(f"Background task error: {e}", exc_info=True)
             def mark_tasks_error(user_data):
@@ -484,10 +481,7 @@ def check_task_details_status(goal_id):
                     is_complete = False
                     break
         break
-    return jsonify({
-        'isComplete': is_complete,
-        'goalId': goal_id
-    })
+    return jsonify({'isComplete': is_complete, 'goalId': goal_id})
 
 @app.route('/goals', methods=['GET'])
 @login_required
@@ -638,27 +632,14 @@ Return only the tasks, one per line. Be specific and concise."""
             logging.error(f"Gemini failed to generate tasks for goal '{goal_text}'.")
             return jsonify({"error": "Failed to generate tasks", "message_detail": "The AI model could not generate tasks for this goal. Please try again later."}), 500
         tasks = [t.strip() for t in task_response.text.split('\n') if t.strip()]
-        new_tasks = []
-        for task in tasks:
-            new_tasks.append({
-                'id': str(uuid.uuid4()),
-                'text': task,
-                'completed': False,
-                'due_date': extract_date_from_text(goal_text),
-                'context': '',
-                'importance': '50',
-                'tags': generate_task_tags(task)
-            })
+        new_tasks = [{"id": str(uuid.uuid4()), "text": task, "completed": False, "due_date": extract_date_from_text(goal_text), "context": '', "importance": '50', "tags": generate_task_tags(task)} for task in tasks]
         def update_goal_tasks(user_data):
             for goal in user_data.get('goals', []):
                 if goal['id'] == goal_id:
                     goal['tasks'] = new_tasks
                     break
         update_user_data(session['user_id'], update_goal_tasks)
-        return jsonify({
-            "success": True,
-            "tasks": new_tasks
-        })
+        return jsonify({"success": True, "tasks": new_tasks})
     except Exception as e:
         logging.error(f"Error generating tasks for goal '{goal_text}': {e}", exc_info=True)
         return jsonify({"error": str(e), "message_detail": "Failed to generate tasks for this goal. Please try again later."}), 500
@@ -692,11 +673,7 @@ IMPORTANCE: [number 1-100]
                         task['context'] = format_gemini_response(context)
                         task['importance'] = importance
         update_user_data(session['user_id'], update_task_details)
-        return jsonify({
-            "success": True,
-            "context": context,
-            "importance": importance
-        })
+        return jsonify({"success": True, "context": context, "importance": importance})
     except Exception as e:
         logging.error(f"Error generating task details for task '{task_text}': {e}", exc_info=True)
         return jsonify({"error": str(e), "message_detail": "Failed to generate task details. Please try again later."}), 500
@@ -772,42 +749,24 @@ def get_task_category(due_date):
 @login_required
 def get_categorized_tasks():
     user = get_user_data(session['user_id'])
-    categorized_tasks = {
-        "today": [],
-        "tomorrow": [],
-        "future": []
-    }
+    categorized_tasks = {"today": [], "tomorrow": [], "future": []}
     goals = user.get('goals', [])
     if goals:
         latest_goal = goals[-1]
         ai_tasks = []
         manual_tasks = []
         for task in latest_goal.get('tasks', []):
-            task_with_goal = {
-                **task,
-                'goalId': latest_goal['id'],
-                'goalText': latest_goal['text']
-            }
-            if task.get('isManual', False):
-                manual_tasks.append(task_with_goal)
-            else:
-                ai_tasks.append(task_with_goal)
-        for task in ai_tasks:
-            category = get_task_category(task.get('due_date'))
-            categorized_tasks[category].append(task)
-        for task in manual_tasks:
-            category = get_task_category(task.get('due_date'))
-            categorized_tasks[category].append(task)
+            task_with_goal = {**task, 'goalId': latest_goal['id'], 'goalText': latest_goal['text']}
+            (manual_tasks if task.get('isManual', False) else ai_tasks).append(task_with_goal)
+        for task in ai_tasks + manual_tasks:
+            categorized_tasks[get_task_category(task.get('due_date'))].append(task)
     return jsonify(categorized_tasks)
 
 @app.route('/tasks/completed', methods=['GET'])
 @login_required
 def get_completed_tasks():
     user = get_user_data(session['user_id'])
-    completed_tasks = []
-    if user.get('goals'):
-        latest_goal = user['goals'][-1]
-        completed_tasks = [task for task in latest_goal.get('tasks', []) if task.get('completed')]
+    completed_tasks = [task for task in user.get('goals', [-1])[0].get('tasks', []) if task.get('completed')] if user.get('goals') else []
     return jsonify(completed_tasks)
 
 @app.route('/task/move', methods=['POST'])
@@ -834,29 +793,16 @@ def move_task():
 @login_required
 def get_task_stats():
     user = get_user_data(session['user_id'])
-    stats = {
-        'total_tasks': 0,
-        'completed_tasks': 0,
-        'completion_rate': 0,
-        'tasks_by_priority': {'high': 0, 'medium': 0, 'low': 0},
-        'tasks_by_category': {'today': 0, 'tomorrow': 0, 'future': 0}
-    }
+    stats = {'total_tasks': 0, 'completed_tasks': 0, 'completion_rate': 0, 'tasks_by_priority': {'high': 0, 'medium': 0, 'low': 0}, 'tasks_by_category': {'today': 0, 'tomorrow': 0, 'future': 0}}
     if user.get('goals'):
-        latest_goal = user['goals'][-1]
-        tasks = latest_goal.get('tasks', [])
+        tasks = user['goals'][-1].get('tasks', [])
         stats['total_tasks'] = len(tasks)
         stats['completed_tasks'] = sum(1 for t in tasks if t.get('completed'))
         stats['completion_rate'] = (stats['completed_tasks'] / stats['total_tasks'] * 100) if stats['total_tasks'] > 0 else 0
         for task in tasks:
             importance = int(task.get('importance', 0))
-            if importance > 75:
-                stats['tasks_by_priority']['high'] += 1
-            elif importance > 50:
-                stats['tasks_by_priority']['medium'] += 1
-            else:
-                stats['tasks_by_priority']['low'] += 1
-            category = get_task_category(task.get('due_date'))
-            stats['tasks_by_category'][category] += 1
+            stats['tasks_by_priority']['high' if importance > 75 else 'medium' if importance > 50 else 'low'] += 1
+            stats['tasks_by_category'][get_task_category(task.get('due_date'))] += 1
     return jsonify(stats)
 
 @app.route('/users/all', methods=['GET'])
@@ -865,10 +811,8 @@ def get_task_stats():
 def get_all_users_admin():
     data = load_data()
     search_term = request.args.get('search', '').lower()
-    users_data = []
-    for user in data['users']:
-        if search_term in user['name'].lower() or search_term in user['email'].lower():
-            users_data.append({"id": user['id'], "name": user['name'], "email": user['email'], "settings": user.get('settings', {})})
+    users_data = [{"id": user['id'], "name": user['name'], "email": user['email'], "settings": user.get('settings', {})}
+                  for user in data['users'] if search_term in user['name'].lower() or search_term in user['email'].lower()]
     return jsonify(users_data)
 
 @app.route('/tasks/all', methods=['GET'])
@@ -876,23 +820,13 @@ def get_all_users_admin():
 @admin_required
 def get_all_tasks_admin():
     data = load_data()
-    all_tasks = []
     search_term = request.args.get('search', '').lower()
+    all_tasks = []
     for user in data['users']:
         for goal in user.get('goals', []):
             for task in goal.get('tasks', []):
-                task_text_lower = task['text'].lower()
-                goal_name_lower = goal['text'].lower()
-                if search_term in task_text_lower or search_term in goal_name_lower:
-                    task_with_goal_user = {
-                        **task,
-                        'goalId': goal['id'],
-                        'goalName': goal['text'],
-                        'userId': user['id'],
-                        'userName': user['name'],
-                        'userEmail': user['email']
-                    }
-                    all_tasks.append(task_with_goal_user)
+                if search_term in task['text'].lower() or search_term in goal['text'].lower():
+                    all_tasks.append({**task, 'goalId': goal['id'], 'goalName': goal['text'], 'userId': user['id'], 'userName': user['name'], 'userEmail': user['email']})
     return jsonify(all_tasks)
 
 @app.route('/user/<user_id>/details', methods=['GET'])
@@ -903,22 +837,8 @@ def get_user_details_admin(user_id):
     user_data = next((u for u in data['users'] if u['id'] == user_id), None)
     if not user_data:
         return jsonify({'message': 'User not found'}), 404
-    user_tasks = []
-    user_goals = user_data.get('goals', [])
-    user_settings = user_data.get('settings', {})
-    for goal in user_goals:
-        for task in goal.get('tasks', []):
-            task_with_goal = {
-                **task,
-                'goalId': goal['id'],
-                'goalName': goal['text']
-            }
-            user_tasks.append(task_with_goal)
-    user_details = {
-        'user': {"id": user_data['id'], "name": user_data['name'], "email": user_data['email'], "settings": user_settings},
-        'tasks': user_tasks,
-        'goals': user_goals
-    }
+    user_tasks = [{**task, 'goalId': goal['id'], 'goalName': goal['text']} for goal in user_data.get('goals', []) for task in goal.get('tasks', [])]
+    user_details = {'user': {"id": user_data['id'], "name": user_data['name'], "email": user_data['email'], "settings": user_data.get('settings', {})}, 'tasks': user_tasks, 'goals': user_data.get('goals', [])}
     return jsonify(user_details)
 
 @app.route('/admin')
@@ -934,61 +854,39 @@ def check_due_tasks():
     notifications = []
     for user in users:
         if user.get('goals'):
-            latest_goal = user['goals'][-1]
-            for task in latest_goal.get('tasks', []):
+            for task in user['goals'][-1].get('tasks', []):
                 if not task.get('completed') and task.get('due_date'):
                     try:
-                        due_date = datetime.strptime(task.get('due_date'), '%Y-%m-%d')
+                        due_date = datetime.strptime(task['due_date'], '%Y-%m-%d')
                         if due_date.date() == now.date():
-                            notifications.append({
-                                'user_id': user['id'],
-                                'task_id': task['id'],
-                                'message': f"Task due today: {task['text']}"
-                            })
+                            notifications.append({'user_id': user['id'], 'task_id': task['id'], 'message': f"Task due today: {task['text']}"})
                         elif due_date.date() == tomorrow.date():
-                            notifications.append({
-                                'user_id': user['id'],
-                                'task_id': task['id'],
-                                'message': f"Task due tomorrow: {task['text']}"
-                            })
+                            notifications.append({'user_id': user['id'], 'task_id': task['id'], 'message': f"Task due tomorrow: {task['text']}"})
                     except ValueError:
                         logging.warning(f"Invalid date format for task '{task['text']}', task ID: {task['id']}")
-                        continue
     return notifications
 
 def generate_task_dependencies(tasks):
     dependencies = []
-    for i, task in enumerate(tasks):
-        if i > 0:
-            prompt = f"""User's Name: {session.get('user_name')}
+    for i, task in enumerate(tasks[1:], 1):
+        prompt = f"""User's Name: {session.get('user_name')}
 Given these two tasks:
-
 {tasks[i-1]['text']}
-
 {task['text']}
-
 Should task 2 depend on task 1? Answer only YES or NO."""
-            try:
-                response = model.generate_content(prompt)
-                if 'YES' in response.text.upper():
-                    dependencies.append({
-                        'dependent': task['id'],
-                        'dependency': tasks[i-1]['id']
-                    })
-            except Exception as e:
-                logging.error(f"Error generating dependency for tasks '{tasks[i-1]['text']}' and '{task['text']}': {e}", exc_info=True)
-                continue
+        try:
+            response = model.generate_content(prompt)
+            if 'YES' in response.text.upper():
+                dependencies.append({'dependent': task['id'], 'dependency': tasks[i-1]['id']})
+        except Exception as e:
+            logging.error(f"Error generating dependency for tasks '{tasks[i-1]['text']}' and '{task['text']}': {e}", exc_info=True)
     return dependencies
 
 def generate_task_suggestions(user_id):
     user = get_user_data(user_id)
     settings = user.get('settings', {})
-    completed_tasks = []
-    user_name = user.get('name')
-    if user.get('goals'):
-        latest_goal = user['goals'][-1]
-        completed_tasks = [t['text'] for t in latest_goal.get('tasks', []) if t.get('completed')]
-    prompt = f"""User's Name: {user_name}
+    completed_tasks = [t['text'] for t in user.get('goals', [-1])[0].get('tasks', []) if t.get('completed')] if user.get('goals') else []
+    prompt = f"""User's Name: {user.get('name')}
 Based on:
 Work description: {settings.get('workDescription')}
 Completed tasks: {', '.join(completed_tasks)}
@@ -1000,6 +898,11 @@ Return only the tasks, one per line."""
     except Exception as e:
         logging.error(f"Error generating task suggestions for user ID '{user_id}': {e}", exc_info=True)
         return []
+
+# Vercel serverless function entry point
+def handler(request):
+    with app.request_context(request.environ):
+        return app.full_dispatch_request()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
