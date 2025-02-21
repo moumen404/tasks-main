@@ -1,9 +1,7 @@
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 import google.generativeai as genai
-import json
 import os
 import uuid
-from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import re
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -12,20 +10,65 @@ import threading
 import time
 from threading import Event
 import logging
+from pymongo import MongoClient
+from pymongo.errors import ConfigurationError, ConnectionFailure
 
+# Configure logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
-genai.configure(api_key="AIzaSyDFSiXE-eyZBABcKZ3Tj0Ssdsm1iIRlaoE") # Replace with your actual API key or use environment variable
-model = genai.GenerativeModel('gemini-pro')
-
-load_dotenv()
+# Hardcoded environment variables
+MONGODB_URI = "mongodb+srv://diatask:diataskpassword@cluster0.abc123.mongodb.net/my_database?retryWrites=true&w=majority"  # Replace with your MongoDB URI
+GEMINI_API_KEY = "AIzaSyCKcbHo3lbOzPL5k7hI1IsU5D8XtLkFODA"  # Replace with your Gemini API key
+SECRET_KEY = "your_secret_key_here"  # Replace with a secure random string (e.g., secrets.token_hex(16))
+ADMIN_SIGNUP_KEY = "your_admin_signup_key_here"  # Replace with your admin signup key
 
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(16))
-ADMIN_SIGNUP_KEY = os.getenv('ADMIN_SIGNUP_KEY')
+app.secret_key = SECRET_KEY
 
-DATA_FILE = 'data.json'
+# MongoDB Connection
+def get_db():
+    try:
+        if not MONGODB_URI:
+            raise ValueError("MONGODB_URI is not set")
+        client = MongoClient(MONGODB_URI)
+        return client['my_database']
+    except (ConfigurationError, ConnectionFailure, ValueError) as e:
+        logging.error(f"Failed to connect to MongoDB: {e}")
+        raise Exception(f"Database connection failed: {e}")
+
+# Initialize Database with Admin User
+def init_db():
+    try:
+        db = get_db()
+        if db.users.count_documents({}) == 0:
+            admin_password_hash = generate_password_hash('password')
+            admin_user = {
+                "id": str(uuid.uuid4()),
+                "name": "Admin User",
+                "email": "admin@example.com",
+                "password": admin_password_hash,
+                "goals": [],
+                "settings": {},
+                "is_admin": True
+            }
+            db.users.insert_one(admin_user)
+            logging.info("Initialized database with admin user")
+    except Exception as e:
+        logging.error(f"Database initialization failed: {e}")
+        raise
+
+# Initialize database when the app starts
+try:
+    init_db()
+except Exception as e:
+    logging.error(f"Application startup failed due to database error: {e}")
+    exit(1)
+
+# API Key Configuration
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-pro')
+
 task_detail_events = {}
 
 def format_gemini_response(text):
@@ -45,55 +88,19 @@ def format_gemini_response(text):
     text = re.sub(r'\s+', ' ', text)
     return text
 
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        # Initialize data with admin user if data file doesn't exist
-        admin_password_hash = generate_password_hash('password')
-        initial_data = {
-            "users": [
-                {
-                    "id": str(uuid.uuid4()),
-                    "name": "Admin User",
-                    "email": "admin@example.com",
-                    "password": admin_password_hash,
-                    "goals": [],
-                    "settings": {},
-                    "is_admin": True  # First user is admin
-                }
-            ]
-        }
-        save_data(initial_data)
-        return initial_data
-    try:
-        with open(DATA_FILE, 'r') as f:
-            data = json.load(f)
-            if 'users' in data and isinstance(data['users'], list) and len(data['users']) > 0: # More robust check
-                # Ensure the first user in the list is admin
-                data['users'][0]['is_admin'] = True
-                save_data(data)
-            return data
-    except (json.JSONDecodeError, IOError) as e:
-        logging.error(f"Error loading data from {DATA_FILE}: {e}", exc_info=True)
-        return {"users": []}
-
-def save_data(data):
-    try:
-        with open(DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-    except IOError as e:
-        logging.error(f"Error saving data to {DATA_FILE}: {e}", exc_info=True)
-
 def get_user_data(user_id):
-    data = load_data()
-    user = next((u for u in data['users'] if u['id'] == user_id), None)
+    db = get_db()
+    user = db.users.find_one({"id": user_id})
+    if user:
+        user['_id'] = str(user['_id'])  # Convert ObjectId to string
     return user
 
 def update_user_data(user_id, update_func):
-    data = load_data()
-    user_index = next((i for i, u in enumerate(data['users']) if u['id'] == user_id), None)
-    if user_index is not None:
-        update_func(data['users'][user_index])
-        save_data(data)
+    db = get_db()
+    user = db.users.find_one({"id": user_id})
+    if user:
+        update_func(user)
+        db.users.update_one({"id": user_id}, {"$set": user})
         return True
     return False
 
@@ -214,8 +221,8 @@ def login():
     password = data.get('password')
     if not email or not password:
         return jsonify({'success': False, 'message': 'Email and password are required', 'message_detail': 'Please enter your email and password.'}), 400
-    all_data = load_data()
-    user = next((u for u in all_data['users'] if u['email'] == email), None)
+    db = get_db()
+    user = db.users.find_one({"email": email})
     if user and check_password_hash(user['password'], password):
         session['user_id'] = user['id']
         session['user_name'] = user['name']
@@ -236,8 +243,8 @@ def signup():
     admin_key = data.get('adminKey')
     if not name or not email or not password:
         return jsonify({'success': False, 'message': 'All fields are required', 'message_detail': 'Please fill in all the required fields for signup.'}), 400
-    all_data = load_data()
-    if any(u['email'] == email for u in all_data['users']):
+    db = get_db()
+    if db.users.find_one({"email": email}):
         logging.warning(f"Signup attempt failed. Email '{email}' already exists.")
         return jsonify({'success': False, 'message': 'Email already exists', 'message_detail': 'This email address is already registered. Please use a different email or login.'}), 400
     user_id = str(uuid.uuid4())
@@ -253,8 +260,7 @@ def signup():
         'settings': {},
         'is_admin': is_admin
     }
-    all_data['users'].append(new_user)
-    save_data(all_data)
+    db.users.insert_one(new_user)
     logging.info(f"New user '{email}' signed up successfully. Admin: {is_admin}")
     return jsonify({'success': True})
 
@@ -415,11 +421,7 @@ def generate_task_details_bg(user_id, goal_id):
     with app.app_context():
         try:
             user_data = get_user_data(user_id)
-            user_name = None
-            for user in load_data().get('users', []):
-                if user['id'] == user_id:
-                    user_name = user.get('name', 'User')
-                    break
+            user_name = user_data.get('name', 'User')
 
             def update_tasks(user_data):
                 for goal in user_data.get('goals', []):
@@ -506,17 +508,15 @@ def update_task():
         data = request.get_json()
         task_id = data.get('taskId')
         completed = data.get('completed')
-        def update_task_status(user_data):
-            for goal in user_data.get('goals', []):
-                for task in goal.get('tasks', []):
-                    if task['id'] == task_id:
-                        task['completed'] = completed
-                        if completed:
-                            task['completedAt'] = datetime.now().isoformat()
-                        break
-        if not update_user_data(session['user_id'], update_task_status):
-            return jsonify({'success': False, 'message': 'Task not found'}), 404
-        return jsonify({"success": True})
+        db = get_db()
+        result = db.users.update_one(
+            {"id": session['user_id'], "goals.tasks.id": task_id},
+            {"$set": {"goals.$[].tasks.$[task].completed": completed, "goals.$[].tasks.$[task].completedAt": datetime.now().isoformat() if completed else None}},
+            array_filters=[{"task.id": task_id}]
+        )
+        if result.modified_count > 0:
+            return jsonify({"success": True})
+        return jsonify({'success': False, 'message': 'Task not found'}), 404
     except Exception as e:
         logging.error(f"Error updating task status for task ID '{task_id}': {e}", exc_info=True)
         return jsonify({"error": str(e), "message_detail": "Failed to update task status. Please try again."}), 500
@@ -529,15 +529,20 @@ def add_goal():
         goal_text = data.get('goal')
         if not goal_text:
             return jsonify({'success': False, 'message': 'Goal text is required', 'message_detail': 'Please provide text for your new goal.'}), 400
-        def add_new_goal(user_data):
-            user_data.setdefault('goals', []).append({
-                'id': str(uuid.uuid4()),
-                'text': goal_text,
-                'tasks': [],
-                'isGenerated': False
-            })
-        update_user_data(session['user_id'], add_new_goal)
-        return jsonify({"success": True})
+        new_goal = {
+            'id': str(uuid.uuid4()),
+            'text': goal_text,
+            'tasks': [],
+            'isGenerated': False
+        }
+        db = get_db()
+        result = db.users.update_one(
+            {"id": session['user_id']},
+            {"$push": {"goals": new_goal}}
+        )
+        if result.modified_count > 0:
+            return jsonify({"success": True})
+        return jsonify({'success': False, 'message': 'User not found'}), 404
     except Exception as e:
         logging.error(f"Error adding new goal: {e}", exc_info=True)
         return jsonify({"error": str(e), "message_detail": "Failed to add new goal. Please try again."}), 500
@@ -560,16 +565,27 @@ def add_task():
             'tags': generate_task_tags(task_data['text']),
             'isManual': True
         }
-        def add_new_task(user_data):
-            if not user_data.get('goals'):
-                user_data['goals'] = [{
-                    'id': str(uuid.uuid4()),
-                    'text': 'Tasks',
-                    'tasks': [],
-                    'isGenerated': False
-                }]
-            user_data['goals'][-1]['tasks'].append(new_task)
-        update_user_data(session['user_id'], add_new_task)
+        db = get_db()
+        user = db.users.find_one({"id": session['user_id']})
+        if not user:
+            return jsonify({'success': False, 'message': 'User not found'}), 404
+        if not user.get('goals'):
+            new_goal = {
+                'id': str(uuid.uuid4()),
+                'text': 'Tasks',
+                'tasks': [new_task],
+                'isGenerated': False
+            }
+            db.users.update_one(
+                {"id": session['user_id']},
+                {"$set": {"goals": [new_goal]}}
+            )
+        else:
+            db.users.update_one(
+                {"id": session['user_id']},
+                {"$push": {"goals.$[last].tasks": new_task}},
+                array_filters=[{"last.id": user['goals'][-1]['id']}]
+            )
         return jsonify({"success": True, "task": new_task})
     except Exception as e:
         logging.error(f"Error adding new task: {e}", exc_info=True)
@@ -582,9 +598,12 @@ def settings():
     if request.method == 'GET':
         return jsonify(user.get('settings', {}))
     settings_data = request.get_json()
-    def update_settings(user_data):
-        user_data['settings'] = settings_data
-    if update_user_data(session['user_id'], update_settings):
+    db = get_db()
+    result = db.users.update_one(
+        {"id": session['user_id']},
+        {"$set": {"settings": settings_data}}
+    )
+    if result.modified_count > 0:
         return jsonify({'success': True})
     return jsonify({'success': False, 'message': 'Failed to save settings', 'message_detail': 'Could not save your settings. Please try again.'}), 400
 
@@ -653,16 +672,17 @@ Return only the tasks, one per line. Be specific and concise."""
                 'importance': '50',
                 'tags': generate_task_tags(task)
             })
-        def update_goal_tasks(user_data):
-            for goal in user_data.get('goals', []):
-                if goal['id'] == goal_id:
-                    goal['tasks'] = new_tasks
-                    break
-        update_user_data(session['user_id'], update_goal_tasks)
-        return jsonify({
-            "success": True,
-            "tasks": new_tasks
-        })
+        db = get_db()
+        result = db.users.update_one(
+            {"id": session['user_id'], "goals.id": goal_id},
+            {"$set": {"goals.$.tasks": new_tasks}}
+        )
+        if result.modified_count > 0:
+            return jsonify({
+                "success": True,
+                "tasks": new_tasks
+            })
+        return jsonify({'success': False, 'message': 'Goal not found'}), 404
     except Exception as e:
         logging.error(f"Error generating tasks for goal '{goal_text}': {e}", exc_info=True)
         return jsonify({"error": str(e), "message_detail": "Failed to generate tasks for this goal. Please try again later."}), 500
@@ -689,18 +709,19 @@ IMPORTANCE: [number 1-100]
         importance_match = re.search(r"IMPORTANCE:\s*(\d+)", response_text)
         context = context_match.group(1).strip() if context_match else ""
         importance = importance_match.group(1) if importance_match else "50"
-        def update_task_details(user_data):
-            for goal in user_data.get('goals', []):
-                for task in goal.get('tasks', []):
-                    if task['id'] == task_id:
-                        task['context'] = format_gemini_response(context)
-                        task['importance'] = importance
-        update_user_data(session['user_id'], update_task_details)
-        return jsonify({
-            "success": True,
-            "context": context,
-            "importance": importance
-        })
+        db = get_db()
+        result = db.users.update_one(
+            {"id": session['user_id'], "goals.tasks.id": task_id},
+            {"$set": {"goals.$[].tasks.$[task].context": format_gemini_response(context), "goals.$[].tasks.$[task].importance": importance}},
+            array_filters=[{"task.id": task_id}]
+        )
+        if result.modified_count > 0:
+            return jsonify({
+                "success": True,
+                "context": context,
+                "importance": importance
+            })
+        return jsonify({'success': False, 'message': 'Task not found'}), 404
     except Exception as e:
         logging.error(f"Error generating task details for task '{task_text}': {e}", exc_info=True)
         return jsonify({"error": str(e), "message_detail": "Failed to generate task details. Please try again later."}), 500
@@ -709,12 +730,14 @@ IMPORTANCE: [number 1-100]
 @login_required
 def delete_task(task_id):
     try:
-        def remove_task(user_data):
-            for goal in user_data.get('goals', []):
-                goal['tasks'] = [t for t in goal.get('tasks', []) if t['id'] != task_id]
-        if not update_user_data(session['user_id'], remove_task):
-            return jsonify({'success': False, 'message': 'Task not found'}), 404
-        return jsonify({"success": True})
+        db = get_db()
+        result = db.users.update_one(
+            {"id": session['user_id'], "goals.tasks.id": task_id},
+            {"$pull": {"goals.$[].tasks": {"id": task_id}}}
+        )
+        if result.modified_count > 0:
+            return jsonify({"success": True})
+        return jsonify({'success': False, 'message': 'Task not found'}), 404
     except Exception as e:
         logging.error(f"Error deleting task with ID '{task_id}': {e}", exc_info=True)
         return jsonify({"error": str(e), "message_detail": "Failed to delete task. Please try again."}), 500
@@ -731,25 +754,20 @@ def update_task_details():
         importance = data.get('importance')
         if not task_id:
             return jsonify({"error": "Task ID is required", "message_detail": "Please provide the ID of the task to update."}), 400
-        task_found = False
-        def update_task_info(user_data):
-            nonlocal task_found
-            for goal in user_data.get('goals', []):
-                for task in goal.get('tasks', []):
-                    if task['id'] == task_id:
-                        task_found = True
-                        task['text'] = task_text
-                        task['due_date'] = due_date
-                        task['context'] = context
-                        task['importance'] = importance
-                        break
-                if task_found:
-                    break
-        if not update_user_data(session['user_id'], update_task_info):
-            return jsonify({'success': False, 'message': 'User not found'}), 404
-        if not task_found:
-            return jsonify({"error": "Task not found", "message_detail": "The task with the provided ID could not be found."}), 404
-        return jsonify({"success": True})
+        db = get_db()
+        result = db.users.update_one(
+            {"id": session['user_id'], "goals.tasks.id": task_id},
+            {"$set": {
+                "goals.$[].tasks.$[task].text": task_text,
+                "goals.$[].tasks.$[task].due_date": due_date,
+                "goals.$[].tasks.$[task].context": context,
+                "goals.$[].tasks.$[task].importance": importance
+            }},
+            array_filters=[{"task.id": task_id}]
+        )
+        if result.modified_count > 0:
+            return jsonify({"success": True})
+        return jsonify({"error": "Task not found", "message_detail": "The task with the provided ID could not be found."}), 404
     except Exception as e:
         logging.error(f"Error updating task details for task ID '{task_id}': {e}", exc_info=True)
         return jsonify({"error": str(e), "message_detail": "Failed to update task details. Please try again."}), 500
@@ -821,15 +839,15 @@ def move_task():
         data = request.get_json()
         task_id = data.get('taskId')
         new_date = data.get('newDate')
-        def update_task_date(user_data):
-            for goal in user_data.get('goals', []):
-                for task in goal.get('tasks', []):
-                    if task['id'] == task_id:
-                        task['due_date'] = new_date
-                        break
-        if not update_user_data(session['user_id'], update_task_date):
-            return jsonify({'success': False, 'message': 'Task not found'}), 404
-        return jsonify({"success": True})
+        db = get_db()
+        result = db.users.update_one(
+            {"id": session['user_id'], "goals.tasks.id": task_id},
+            {"$set": {"goals.$[].tasks.$[task].due_date": new_date}},
+            array_filters=[{"task.id": task_id}]
+        )
+        if result.modified_count > 0:
+            return jsonify({"success": True})
+        return jsonify({'success': False, 'message': 'Task not found'}), 404
     except Exception as e:
         logging.error(f"Error moving task with ID '{task_id}' to new date: {e}", exc_info=True)
         return jsonify({"error": str(e), "message_detail": "Failed to move task. Please try again."}), 500
@@ -867,10 +885,11 @@ def get_task_stats():
 @login_required
 @admin_required
 def get_all_users_admin():
-    data = load_data()
+    db = get_db()
     search_term = request.args.get('search', '').lower()
     users_data = []
-    for user in data['users']:
+    users = db.users.find({}, {"_id": 0, "password": 0})
+    for user in users:
         if search_term in user['name'].lower() or search_term in user['email'].lower():
             users_data.append({"id": user['id'], "name": user['name'], "email": user['email'], "settings": user.get('settings', {})})
     return jsonify(users_data)
@@ -879,10 +898,11 @@ def get_all_users_admin():
 @login_required
 @admin_required
 def get_all_tasks_admin():
-    data = load_data()
+    db = get_db()
     all_tasks = []
     search_term = request.args.get('search', '').lower()
-    for user in data['users']:
+    users = db.users.find({}, {"_id": 0, "password": 0})
+    for user in users:
         for goal in user.get('goals', []):
             for task in goal.get('tasks', []):
                 task_text_lower = task['text'].lower()
@@ -903,8 +923,8 @@ def get_all_tasks_admin():
 @login_required
 @admin_required
 def get_user_details_admin(user_id):
-    data = load_data()
-    user_data = next((u for u in data['users'] if u['id'] == user_id), None)
+    db = get_db()
+    user_data = db.users.find_one({"id": user_id}, {"_id": 0})
     if not user_data:
         return jsonify({'message': 'User not found'}), 404
     user_tasks = []
@@ -934,7 +954,8 @@ def admin_dashboard():
 def check_due_tasks():
     now = datetime.now()
     tomorrow = now + timedelta(days=1)
-    users = load_data().get('users', [])
+    db = get_db()
+    users = db.users.find({}, {"_id": 0})
     notifications = []
     for user in users:
         if user.get('goals'):
@@ -1006,4 +1027,4 @@ Return only the tasks, one per line."""
         return []
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0')
